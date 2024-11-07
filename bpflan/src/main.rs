@@ -1,5 +1,4 @@
-use anyhow::Context as _;
-use aya::programs::{Xdp, XdpFlags};
+use aya::programs::{tc, SchedClassifier, TcAttachType};
 use clap::Parser;
 #[rustfmt::skip]
 use log::{debug, warn};
@@ -41,10 +40,16 @@ async fn main() -> anyhow::Result<()> {
         warn!("failed to initialize eBPF logger: {}", e);
     }
     let Opt { iface } = opt;
-    let program: &mut Xdp = ebpf.program_mut("bpflan").unwrap().try_into()?;
-    program.load()?;
-    program.attach(&iface, XdpFlags::default())
-        .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
+
+    let _ = tc::qdisc_add_clsact(&iface);
+
+    let program_in: &mut SchedClassifier = ebpf.program_mut("bpflan_out").unwrap().try_into()?;
+    program_in.load()?;
+    program_in.attach(&iface, TcAttachType::Egress)?;
+
+    let program_out: &mut SchedClassifier = ebpf.program_mut("bpflan_in").unwrap().try_into()?;
+    program_out.load()?;
+    program_out.attach(&iface, TcAttachType::Ingress)?;
 
     let ctrl_c = signal::ctrl_c();
     println!("Waiting for Ctrl-C...");

@@ -3,7 +3,11 @@
 
 use core::mem;
 
-use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
+use aya_ebpf::{
+    bindings::{xdp_action, TC_ACT_PIPE, TC_ACT_SHOT},
+    macros::{classifier, xdp},
+    programs::{TcContext, XdpContext},
+};
 use aya_log_ebpf::info;
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -12,52 +16,50 @@ use network_types::{
     udp::UdpHdr,
 };
 
-#[xdp]
-pub fn bpflan(ctx: XdpContext) -> u32 {
+#[classifier]
+pub fn bpflan_out(ctx: TcContext) -> i32 {
+    info!(&ctx, "Egress packet");
+
     match try_bpflan(ctx) {
         Ok(ret) => ret,
-        Err(_) => xdp_action::XDP_ABORTED,
+        Err(_) => TC_ACT_SHOT,
     }
 }
 
-#[inline(always)]
-fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
-    let start = ctx.data();
-    let end = ctx.data_end();
-    let len = mem::size_of::<T>();
-
-    if start + offset + len > end {
-        return Err(());
+#[classifier]
+pub fn bpflan_in(ctx: TcContext) -> i32 {
+    info!(&ctx, "Ingress packet");
+    match try_bpflan(ctx) {
+        Ok(ret) => ret,
+        Err(_) => TC_ACT_SHOT,
     }
-
-    Ok((start + offset) as *const T)
 }
 
-fn try_bpflan(ctx: XdpContext) -> Result<u32, ()> {
+fn try_bpflan(ctx: TcContext) -> Result<i32, ()> {
     // info!(&ctx, "received a packet");
-    let eth_hdr: *const EthHdr = ptr_at(&ctx, 0)?;
-    match unsafe { *eth_hdr }.ether_type {
+    let eth_hdr: EthHdr = ctx.load(0).map_err(|_| ())?;
+    match eth_hdr.ether_type {
         EtherType::Ipv4 => {
-            let ipv4_hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
+            let ipv4_hdr: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
 
-            match unsafe { *ipv4_hdr }.proto {
+            match ipv4_hdr.proto {
                 IpProto::Icmp => {
-                    let eth_src = unsafe { *eth_hdr }.src_addr;
-                    let eth_dst = unsafe { *eth_hdr }.dst_addr;
+                    let eth_src = eth_hdr.src_addr;
+                    let eth_dst = eth_hdr.dst_addr;
                     info!(&ctx, "Eth src: {:mac}", eth_src);
                     info!(&ctx, "Eth dst: {:mac}", eth_dst);
 
-                    let ip_src = u32::from_be(unsafe { *ipv4_hdr }.src_addr);
-                    let ip_dst = u32::from_be(unsafe { *ipv4_hdr }.dst_addr);
+                    let ip_src = u32::from_be(ipv4_hdr.src_addr);
+                    let ip_dst = u32::from_be(ipv4_hdr.dst_addr);
                     info!(&ctx, "IP src: {:i}", ip_src);
                     info!(&ctx, "IP dst: {:i}", ip_dst);
 
-                    Ok(xdp_action::XDP_PASS)
+                    Ok(TC_ACT_PIPE)
                 }
-                _ => Ok(xdp_action::XDP_PASS),
+                _ => Ok(TC_ACT_PIPE),
             }
         }
-        _ => Ok(xdp_action::XDP_PASS),
+        _ => Ok(TC_ACT_PIPE),
     }
 }
 
