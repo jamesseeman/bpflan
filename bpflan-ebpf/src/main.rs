@@ -5,7 +5,9 @@ use core::{mem, net::Ipv4Addr};
 
 use aya_ebpf::{
     bindings::{xdp_action, TC_ACT_PIPE, TC_ACT_SHOT},
-    macros::{classifier, xdp},
+    helpers::bpf_map_update_elem,
+    macros::{classifier, map, xdp},
+    maps::{Array, HashMap},
     programs::{TcContext, XdpContext},
 };
 use aya_log_ebpf::info;
@@ -15,6 +17,9 @@ use network_types::{
     tcp::TcpHdr,
     udp::UdpHdr,
 };
+
+#[map]
+static HIT_COUNT: Array<u32> = Array::with_max_entries(1, 0);
 
 #[classifier]
 pub fn bpflan_out(ctx: TcContext) -> i32 {
@@ -56,6 +61,12 @@ fn try_bpflan(mut ctx: TcContext) -> Result<i32, ()> {
 
                     ipv4_hdr.set_dst_addr(Ipv4Addr::new(8, 8, 8, 8));
                     ctx.store(EthHdr::LEN, &ipv4_hdr, 0).map_err(|_| ())?;
+
+                    if let Some(count) = HIT_COUNT.get_ptr_mut(0) {
+                        unsafe {
+                            *count += 1;
+                        }
+                    }
 
                     Ok(TC_ACT_PIPE)
                 }

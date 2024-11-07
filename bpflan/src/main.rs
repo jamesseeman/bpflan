@@ -1,8 +1,10 @@
-use aya::programs::{tc, SchedClassifier, TcAttachType};
+use aya::{
+    maps::Array,
+    programs::{tc, SchedClassifier, TcAttachType},
+};
 use clap::Parser;
 #[rustfmt::skip]
 use log::{debug, warn};
-use tokio::signal;
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -51,10 +53,18 @@ async fn main() -> anyhow::Result<()> {
     program_out.load()?;
     program_out.attach(&iface, TcAttachType::Ingress)?;
 
-    let ctrl_c = signal::ctrl_c();
-    println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
-    println!("Exiting...");
+    let mut hit_count = Array::try_from(ebpf.map_mut("HIT_COUNT").unwrap())?;
+    hit_count.set(0, 0, 0)?;
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        println!("{}", hit_count.get(&0, 0)?);
+    }
+
+    // let ctrl_c = signal::ctrl_c();
+    // println!("Waiting for Ctrl-C...");
+    // ctrl_c.await?;
+    // println!("Exiting...");
 
     Ok(())
 }
