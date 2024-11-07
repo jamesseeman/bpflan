@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::mem;
+use core::{mem, net::Ipv4Addr};
 
 use aya_ebpf::{
     bindings::{xdp_action, TC_ACT_PIPE, TC_ACT_SHOT},
@@ -35,12 +35,12 @@ pub fn bpflan_in(ctx: TcContext) -> i32 {
     }
 }
 
-fn try_bpflan(ctx: TcContext) -> Result<i32, ()> {
+fn try_bpflan(mut ctx: TcContext) -> Result<i32, ()> {
     // info!(&ctx, "received a packet");
     let eth_hdr: EthHdr = ctx.load(0).map_err(|_| ())?;
     match eth_hdr.ether_type {
         EtherType::Ipv4 => {
-            let ipv4_hdr: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
+            let mut ipv4_hdr: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
 
             match ipv4_hdr.proto {
                 IpProto::Icmp => {
@@ -53,6 +53,9 @@ fn try_bpflan(ctx: TcContext) -> Result<i32, ()> {
                     let ip_dst = u32::from_be(ipv4_hdr.dst_addr);
                     info!(&ctx, "IP src: {:i}", ip_src);
                     info!(&ctx, "IP dst: {:i}", ip_dst);
+
+                    ipv4_hdr.set_dst_addr(Ipv4Addr::new(8, 8, 8, 8));
+                    ctx.store(EthHdr::LEN, &ipv4_hdr, 0).map_err(|_| ())?;
 
                     Ok(TC_ACT_PIPE)
                 }
