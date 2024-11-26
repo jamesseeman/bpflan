@@ -1,10 +1,14 @@
+use std::{fs::OpenOptions, io::Write};
+
 use aya::{
     maps::Array,
     programs::{tc, SchedClassifier, TcAttachType},
 };
 use clap::Parser;
+use fd_lock::RwLock;
 #[rustfmt::skip]
 use log::{debug, warn};
+use tokio::signal;
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -14,6 +18,19 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Attempt to acquire file lock
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open("/var/run/bpflan.lock")?;
+    let mut lock = RwLock::new(file);
+    let mut lock_file = lock
+        .try_write()
+        .expect("Failed to acquire /var/run/bpflan.lock");
+    lock_file.set_len(0)?;
+    writeln!(lock_file, "{}", std::process::id())?;
+
     let opt = Opt::parse();
 
     env_logger::init();
@@ -56,15 +73,15 @@ async fn main() -> anyhow::Result<()> {
     let mut hit_count = Array::try_from(ebpf.map_mut("HIT_COUNT").unwrap())?;
     hit_count.set(0, 0, 0)?;
 
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-        println!("{}", hit_count.get(&0, 0)?);
-    }
+    //loop {
+    //    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    //    println!("{}", hit_count.get(&0, 0)?);
+    //}
 
-    // let ctrl_c = signal::ctrl_c();
-    // println!("Waiting for Ctrl-C...");
-    // ctrl_c.await?;
-    // println!("Exiting...");
+    let ctrl_c = signal::ctrl_c();
+    println!("Waiting for Ctrl-C...");
+    ctrl_c.await?;
+    println!("Exiting...");
 
     Ok(())
 }

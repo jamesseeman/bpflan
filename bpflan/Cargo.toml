@@ -7,14 +7,16 @@ edition = "2021"
 bpflan-common = { path = "../bpflan-common", features = ["user"] }
 
 anyhow = { workspace = true, default-features = true }
+thiserror = "1.0"
 aya = { workspace = true }
 aya-log = { workspace = true }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time"] }
-
 clap = { workspace = true, features = ["derive"] }
+fd-lock = "4.0.2"
+
 [build-dependencies]
 cargo_metadata = { workspace = true }
 # TODO(https://github.com/rust-lang/cargo/issues/12375): this should be an artifact dependency, but

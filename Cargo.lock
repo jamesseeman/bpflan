@@ -201,8 +201,10 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "env_logger",
+ "fd-lock",
  "libc",
  "log",
+ "thiserror",
  "tokio",
 ]
 
@@ -362,6 +364,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "534c5cf6194dfab3db3242765c03bbe257cf92f22b38f6bc0c58d59108a820ba"
 dependencies = [
  "libc",
+ "windows-sys",
+]
+
+[[package]]
+name = "fd-lock"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e5768da2206272c81ef0b5e951a41862938a6070da63bcea197899942d3b947"
+dependencies = [
+ "cfg-if",
+ "rustix",
  "windows-sys",
 ]
 
