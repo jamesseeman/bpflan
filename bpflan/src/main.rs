@@ -1,14 +1,13 @@
 use std::{fs::OpenOptions, io::Write};
 
 use aya::{
-    maps::Array,
+    maps::RingBuf,
     programs::{tc, SchedClassifier, TcAttachType},
 };
 use clap::Parser;
 use fd_lock::RwLock;
 #[rustfmt::skip]
 use log::{debug, warn};
-use tokio::signal;
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -46,10 +45,6 @@ async fn main() -> anyhow::Result<()> {
         debug!("remove limit on locked memory failed, ret is: {}", ret);
     }
 
-    // This will include your eBPF object file as raw bytes at compile-time and load it at
-    // runtime. This approach is recommended for most real-world use cases. If you would
-    // like to specify the eBPF program at runtime rather than at compile-time, you can
-    // reach for `Bpf::load_file` instead.
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/bpflan"
@@ -70,18 +65,12 @@ async fn main() -> anyhow::Result<()> {
     program_out.load()?;
     program_out.attach(&iface, TcAttachType::Ingress)?;
 
-    let mut hit_count = Array::try_from(ebpf.map_mut("HIT_COUNT").unwrap())?;
-    hit_count.set(0, 0, 0)?;
-
-    //loop {
-    //    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    //    println!("{}", hit_count.get(&0, 0)?);
-    //}
-
-    let ctrl_c = signal::ctrl_c();
-    println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
-    println!("Exiting...");
+    let mut ring_buf = RingBuf::try_from(ebpf.map_mut("HIT_COUNT").unwrap())?;
+    loop {
+        while let Some(e) = ring_buf.next() {
+            println!("Received: {:?}", e);
+        }
+    }
 
     Ok(())
 }
