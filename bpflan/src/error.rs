@@ -5,6 +5,8 @@ use thiserror::Error;
 pub enum Error {
     #[error("Failed to create interface")]
     InterfaceCreateFailed,
+    #[error("aya program error")]
+    AyaError,
 }
 
 impl From<std::io::Error> for Error {
@@ -16,5 +18,11 @@ impl From<std::io::Error> for Error {
 impl From<rtnetlink::Error> for Error {
     fn from(err: rtnetlink::Error) -> Self {
         Self::InterfaceCreateFailed
+    }
+}
+
+impl From<aya::programs::ProgramError> for Error {
+    fn from(err: aya::programs::ProgramError) -> Self {
+        Self::AyaError
     }
 }

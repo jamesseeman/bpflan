@@ -1,81 +1,74 @@
+use aya::{
+    programs::{tc, SchedClassifier, TcAttachType},
+    Ebpf,
+};
 use futures::TryStreamExt;
-use rand::Rng;
+use netlink_packet_route::link::LinkAttribute;
 use std::{collections::HashMap, net::SocketAddrV4};
 
+#[derive(Debug)]
 pub struct Network {
     name: String,
     if_index: u32,
-    id: u16, // Technically this is u24, but leaving as u16 for now
+    vni: u16, // Technically this is u24, but leaving as u16 for now
+    hw_addr: [u8; 6],
     peers: HashMap<SocketAddrV4, Option<[u8; 6]>>,
 }
 
 impl Network {
-    pub async fn create(name: &str) -> Result<Self, crate::Error> {
+    pub async fn create(ebpf: &mut Ebpf, name: &str, vni: u16) -> Result<Self, crate::Error> {
         // Connect to rtnetlink
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
 
         // Create interface
-        handle
-            .link()
-            .add()
-            .bridge(format!("bpf-{}", name))
-            .execute()
-            .await?;
+        let iface = format!("bpf-{}", name);
+        handle.link().add().bridge(iface.clone()).execute().await?;
 
         // Get if_index
-        let mut links = handle
-            .link()
-            .get()
-            .match_name(format!("bpf-{}", name))
-            .execute();
-        let if_index = match links.try_next().await? {
-            Some(link) => link.header.index,
+        let mut links = handle.link().get().match_name(iface.clone()).execute();
+
+        let (if_index, hw_addr) = match links.try_next().await? {
+            Some(link) => {
+                // Todo: fix, refactor
+                if let Some(LinkAttribute::Address(addr)) = link
+                    .attributes
+                    .iter()
+                    .find(|attr| matches!(attr, LinkAttribute::Address(_)))
+                {
+                    if let Ok(hw_addr) = addr.as_slice().try_into() {
+                        (link.header.index, hw_addr)
+                    } else {
+                        return Err(crate::Error::InterfaceCreateFailed);
+                    }
+                } else {
+                    return Err(crate::Error::InterfaceCreateFailed);
+                }
+            }
             None => return Err(crate::Error::InterfaceCreateFailed),
         };
 
         // Set interface up
         handle.link().set(if_index).up().execute().await?;
 
-        Ok(Self {
-            name: name.into(),
-            id: rand::thread_rng().gen_range(1..u16::MAX),
-            if_index,
-            peers: HashMap::new(),
-        })
-    }
+        // Load ebpf programs
+        let _ = tc::qdisc_add_clsact(&iface);
 
-    pub async fn create_with_id(name: &str, id: u16) -> Result<Self, crate::Error> {
-        // Connect to rtnetlink
-        let (connection, handle, _) = rtnetlink::new_connection()?;
-        tokio::spawn(connection);
+        let program_in: &mut SchedClassifier =
+            ebpf.program_mut("bpflan_out").unwrap().try_into()?;
+        program_in.load()?;
+        program_in.attach(&iface, TcAttachType::Egress)?;
 
-        // Create interface
-        handle
-            .link()
-            .add()
-            .bridge(format!("bpf-{}", name))
-            .execute()
-            .await?;
-
-        // Get if_idnex
-        let mut links = handle
-            .link()
-            .get()
-            .match_name(format!("bpf-{}", name))
-            .execute();
-        let if_index = match links.try_next().await? {
-            Some(link) => link.header.index,
-            None => return Err(crate::Error::InterfaceCreateFailed),
-        };
-
-        // Set interface up
-        handle.link().set(if_index).up().execute().await?;
+        let program_out: &mut SchedClassifier =
+            ebpf.program_mut("bpflan_in").unwrap().try_into()?;
+        program_out.load()?;
+        program_out.attach(&iface, TcAttachType::Ingress)?;
 
         Ok(Self {
             name: name.into(),
-            id,
+            vni,
             if_index,
+            hw_addr,
             peers: HashMap::new(),
         })
     }

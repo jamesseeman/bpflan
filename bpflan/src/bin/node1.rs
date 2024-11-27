@@ -1,13 +1,16 @@
 use std::{thread, time};
 
-use bpflan::Network;
-
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
-    let n1 = Network::create("test").await?;
+    env_logger::init();
+
+    let mut handle = bpflan::connect()?;
+    let n1 = handle.create_network("test").await?;
+    println!("{:?}", n1);
+
     // n1.add_peer();
 
-    thread::sleep(time::Duration::from_millis(3000));
+    thread::sleep(time::Duration::from_secs(30));
 
     n1.destroy().await?;
 
