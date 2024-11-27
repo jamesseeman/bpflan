@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["bpflan", "bpflan-common", "bpflan-ebpf"]
-default-members = ["bpflan", "bpflan-common"]
+members = ["bpflan", "bpflan-ebpf"]
+default-members = ["bpflan"]
 
 [workspace.dependencies]
 aya = { version = "0.13.0", default-features = false }

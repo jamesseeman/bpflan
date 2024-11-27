@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bpflan-common = { path = "../bpflan-common", features = ["user"] }
+# bpflan-common = { path = "../bpflan-common", features = ["user"] }
 
 anyhow = { workspace = true, default-features = true }
 thiserror = "1.0"
@@ -16,6 +16,9 @@ log = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time"] }
 clap = { workspace = true, features = ["derive"] }
 fd-lock = "4.0.2"
+rand = "0.8.5"
+rtnetlink = "0.14.1"
+futures = "0.3"
 
 [build-dependencies]
 cargo_metadata = { workspace = true }
