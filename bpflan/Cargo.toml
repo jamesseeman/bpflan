@@ -19,6 +19,7 @@ fd-lock = "4.0.2"
 rand = "0.8.5"
 rtnetlink = "0.14.1"
 netlink-packet-route = "0.19.0"
+nix = "0.23"
 futures = "0.3"
 
 [build-dependencies]
@@ -40,3 +41,6 @@ bpflan-ebpf = { path = "../bpflan-ebpf" }
 [[bin]]
 name = "bpflan"
 path = "src/main.rs"
+
+[dev-dependencies]
+serial_test = "3.1.1"
