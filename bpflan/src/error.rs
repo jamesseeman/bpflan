@@ -9,6 +9,10 @@ pub enum Error {
     AyaError,
     #[error("ioctl call failed")]
     IoctlError,
+    #[error("ebpf mapping failed")]
+    MapError,
+    #[error("interface not found")]
+    InterfaceNotFound,
 }
 
 impl From<std::io::Error> for Error {
@@ -32,5 +36,11 @@ impl From<aya::programs::ProgramError> for Error {
 impl From<nix::Error> for Error {
     fn from(err: nix::Error) -> Self {
         Self::IoctlError
+    }
+}
+
+impl From<aya::maps::MapError> for Error {
+    fn from(err: aya::maps::MapError) -> Self {
+        Self::MapError
     }
 }

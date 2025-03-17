@@ -3,13 +3,15 @@ use aya::Ebpf;
 use fd_lock::RwLock;
 use log::{debug, warn};
 pub use network::Network;
-use std::{fs::OpenOptions, io::Write};
+use std::{fs::OpenOptions, io::Write, sync::Arc};
+use tokio::sync::Mutex;
 
 mod error;
 pub use error::Error;
 
+#[derive(Clone)]
 pub struct Handle {
-    ebpf: Ebpf,
+    ebpf: Arc<Mutex<Ebpf>>,
 }
 
 impl Handle {
@@ -49,11 +51,13 @@ impl Handle {
             warn!("failed to initialize eBPF logger: {}", e);
         }
 
-        Ok(Self { ebpf })
+        Ok(Self {
+            ebpf: Arc::new(Mutex::new(ebpf)),
+        })
     }
 
     pub async fn create_network(&mut self, name: &str) -> Result<Network, crate::Error> {
-        Network::create(&mut self.ebpf, name, 0).await
+        Network::create(self.ebpf.clone(), name, 0).await
     }
 
     pub async fn create_network_with_vni(
@@ -61,7 +65,7 @@ impl Handle {
         name: &str,
         vni: u16,
     ) -> Result<Network, crate::Error> {
-        Network::create(&mut self.ebpf, name, vni).await
+        Network::create(self.ebpf.clone(), name, vni).await
     }
 }
 

@@ -8,5 +8,5 @@
 ## Build & Run
 
 ```shell
-cargo run --release --config 'target."cfg(all())".runner="sudo -E"' --bin bpflan -- --iface eno1
+RUST_LOG=info cargo run --release --config 'target."cfg(all())".runner="sudo -E"' --bin bpflan -- --iface eno1
 ```

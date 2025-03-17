@@ -14,6 +14,7 @@ env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time"] }
+tokio-stream = "0.1.16"
 clap = { workspace = true, features = ["derive"] }
 fd-lock = "4.0.2"
 rand = "0.8.5"

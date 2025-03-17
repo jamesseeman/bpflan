@@ -1,4 +1,5 @@
 use aya::{
+    maps::HashMap as EbpfHashMap,
     programs::{tc, SchedClassifier, TcAttachType},
     Ebpf,
 };
@@ -7,8 +8,8 @@ use netlink_packet_route::link::LinkAttribute;
 use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
 use rand::{distributions::Alphanumeric, Rng};
-use std::ffi::CString;
-use std::{collections::HashMap, net::SocketAddrV4};
+use std::{ffi::CString, net::Ipv4Addr, sync::Arc, time::Duration};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct Port {
@@ -29,20 +30,31 @@ impl Port {
     pub fn get_hw_addr(self) -> [u8; 6] {
         self.hw_addr
     }
+
+    // TODO
+    //pub async fn delete(self)
 }
 
 const TUNSETIFF: u64 = 0x400454ca;
 const IFF_TAP: i16 = 0x0002; // TAP device
 const IFF_NO_PI: i16 = 0x1000; // No packet information
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+struct BridgeInterface {
+    name: String,
+    if_index: u32,
+    advertise_addr: Ipv4Addr,
+}
+
+#[derive(Debug)]
 pub struct Network {
     name: String,
     if_index: u32,
     vni: u16, // Technically this is u24, but leaving as u16 for now
     hw_addr: [u8; 6],
-    peers: HashMap<SocketAddrV4, Option<[u8; 6]>>,
+    ebpf: Arc<Mutex<Ebpf>>,
     ports: Vec<Port>,
+    parent_if: Option<BridgeInterface>,
 }
 
 impl Network {
@@ -78,7 +90,11 @@ impl Network {
         }
     }
 
-    pub async fn create(ebpf: &mut Ebpf, name: &str, vni: u16) -> Result<Self, crate::Error> {
+    pub async fn create(
+        ebpf: Arc<Mutex<Ebpf>>,
+        name: &str,
+        vni: u16,
+    ) -> Result<Self, crate::Error> {
         // Connect to rtnetlink
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
@@ -108,36 +124,84 @@ impl Network {
         // Load ebpf programs
         let _ = tc::qdisc_add_clsact(&iface);
 
+        let mut ebpf_mut = ebpf.lock().await;
+
         // TODO: check if TC's are already attached for previously existing interfaces
         let program_in: &mut SchedClassifier =
-            ebpf.program_mut("bpflan_out").unwrap().try_into()?;
+            ebpf_mut.program_mut("bpflan_out").unwrap().try_into()?;
         program_in.load()?;
         program_in.attach(&iface, TcAttachType::Egress)?;
 
         let program_out: &mut SchedClassifier =
-            ebpf.program_mut("bpflan_in").unwrap().try_into()?;
+            ebpf_mut.program_mut("bpflan_in").unwrap().try_into()?;
         program_out.load()?;
         program_out.attach(&iface, TcAttachType::Ingress)?;
+
+        let ebpf_clone = ebpf.clone();
+        tokio::spawn(async move {
+            let mut ebpf_mut = ebpf_clone.lock().await;
+            let arp_cache: EbpfHashMap<_, [u8; 6], u32> =
+                EbpfHashMap::try_from(ebpf_mut.map_mut("ARP_CACHE").unwrap()).unwrap();
+
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+
+                for entry in arp_cache.iter() {
+                    let (key, value) = entry.unwrap();
+                    println!("Entry: {:?}: {}", key, value);
+                }
+            }
+        });
 
         Ok(Self {
             name: name.into(),
             vni,
             if_index,
             hw_addr,
-            peers: HashMap::new(),
+            ebpf: ebpf.clone(),
             ports: vec![],
+            parent_if: None,
         })
     }
 
-    pub fn add_peer(&mut self, peer: SocketAddrV4) {
-        self.peers.insert(peer, None);
+    pub async fn set_parent(
+        &mut self,
+        parent: &str,
+        advertise_addr: Ipv4Addr,
+    ) -> Result<u32, crate::Error> {
+        let (connection, handle, _) = rtnetlink::new_connection()?;
+        if let Some((if_index, _)) = Network::get_interface_by_name(&handle, parent.into()).await {
+            self.parent_if = Some(BridgeInterface {
+                name: parent.into(),
+                if_index,
+                advertise_addr,
+            });
+
+            Ok(if_index)
+        } else {
+            Err(crate::Error::InterfaceNotFound)
+        }
     }
 
-    pub fn drop_peer(&mut self, peer: SocketAddrV4) -> Option<Option<[u8; 6]>> {
-        self.peers.remove(&peer)
+    pub async fn add_peer(&mut self, peer: Ipv4Addr) -> Result<(), crate::Error> {
+        let mut ebpf_mut = self.ebpf.lock().await;
+        let mut peers: EbpfHashMap<_, u32, u32> =
+            EbpfHashMap::try_from(ebpf_mut.map_mut("PEERS").unwrap())?;
+        let peer_int: u32 = peer.into();
+        peers.insert(peer_int, 1, 0); // The value doesn't really matter
+        Ok(())
     }
 
-    pub async fn destroy(self) -> Result<(), crate::Error> {
+    pub async fn drop_peer(&mut self, peer: Ipv4Addr) -> Result<(), crate::Error> {
+        let mut ebpf_mut = self.ebpf.lock().await;
+        let mut peers: EbpfHashMap<_, u32, u32> =
+            EbpfHashMap::try_from(ebpf_mut.map_mut("PEERS").unwrap())?;
+        let peer_int: u32 = peer.into();
+        peers.remove(&peer_int)?;
+        Ok(())
+    }
+
+    pub async fn delete(self) -> Result<(), crate::Error> {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
         handle.link().del(self.if_index).execute().await?;
