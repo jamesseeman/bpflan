@@ -9,6 +9,7 @@ use aya_ebpf::{
     macros::{classifier, map, xdp},
     maps::{Array, HashMap, RingBuf},
     programs::{TcContext, XdpContext},
+    EbpfContext,
 };
 use aya_log_ebpf::info;
 use network_types::{
@@ -40,8 +41,21 @@ static HIT_COUNT: RingBuf = RingBuf::with_byte_size(4, 0);
 #[map]
 static ARP_CACHE: HashMap<[u8; 6], u32> = HashMap::with_max_entries(65536, 0);
 
+// PEERS is a dynamic array i.e. vector of IPv4 address
+// No vector map exists, so the solution is to use the HashMap as a linked list
+// Each index in PEERS points to the next peer.
+// Ex. [192.168.0.1, 192.168.0.2, 192.168.0.3] maps to:
+// PEERS[0] = 3232235521
+// PEERS[3232235521] = 3232235522
+// PEERS[3232235522] = 3232235523
+// PEERS[3232235523] = 0
 #[map]
 static PEERS: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+
+// #[link(name = "bpf")]
+// extern "C" {
+//     fn bpf_f_clone_redirect(ctx: *mut core::ffi::c_void, ifindex: u32, direction: u64) -> i32;
+// }
 
 #[derive(PartialEq)]
 enum Direction {
@@ -67,10 +81,61 @@ pub fn bpflan_in(ctx: TcContext) -> i32 {
     }
 }
 
+fn vxlan_wrap(ctx: &mut TcContext, peer_addr: u32) -> Result<(), ()> {
+    let len = ctx.len();
+
+    // Add a buffer to the beginning of the packet
+    unsafe {
+        bpf_skb_change_head(ctx.skb.skb, BUFFER_LEN as u32, 0);
+    }
+
+    let mut eth_hdr: EthHdr = ctx.load(0).map_err(|_| ())?;
+    eth_hdr.dst_addr = [0, 1, 2, 3, 4, 5];
+    eth_hdr.src_addr = [6, 7, 8, 9, 10, 11];
+    eth_hdr.ether_type = EtherType::Ipv4;
+    ctx.store(0, &eth_hdr, 0).map_err(|_| ())?;
+
+    let mut ip_hdr: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
+    ip_hdr.set_version(4);
+    ip_hdr.set_src_addr(Ipv4Addr::new(1, 2, 3, 4));
+    ip_hdr.set_dst_addr(peer_addr.into());
+    ip_hdr.proto = IpProto::Udp;
+    ip_hdr.set_ihl(5);
+    ctx.store(EthHdr::LEN, &ip_hdr, 0).map_err(|_| ())?;
+
+    let mut udp_hdr: UdpHdr = ctx.load(EthHdr::LEN + Ipv4Hdr::LEN).map_err(|_| ())?;
+    // For now using arbitrary source port
+    // TODO: randomize source port, probably?
+    udp_hdr.source = (60000 as u16).to_be();
+    udp_hdr.dest = (4789 as u16).to_be();
+    let payload_len = len + (VxlanHdr::LEN + UdpHdr::LEN) as u32;
+    udp_hdr.len = (payload_len as u16).to_be();
+    ctx.store(EthHdr::LEN + Ipv4Hdr::LEN, &udp_hdr, 0)
+        .map_err(|_| ())?;
+
+    let mut vxlan_hdr: VxlanHdr = ctx
+        .load(EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN)
+        .map_err(|_| ())?;
+
+    // set_vni_valid doesn't seem to work?
+    vxlan_hdr.flags.set_bit(3, true);
+    vxlan_hdr.vni = ((200 << 8) as u32).to_be();
+    ctx.store(EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN, &vxlan_hdr, 0)
+        .map_err(|_| ())?;
+
+    Ok(())
+}
+
+fn vxlan_unwrap(ctx: &mut TcContext) {
+    // unsafe {
+    //     bpf_skb_change_head(ctx.skb.skb, -BUFFER_LEN as u32, 0);
+    // }
+}
+
 fn try_bpflan(mut ctx: TcContext, direction: Direction) -> Result<i32, ()> {
     let eth_hdr: EthHdr = ctx.load(0).map_err(|_| ())?;
 
-    // For ARP requests and responses, update ARP_CACHE[hw addr] = None since we know the given hw addr is local
+    // For ARP requests and responses, update ARP_CACHE[hw addr] = 0 since we know the given hw addr is local
     // Note: this match is required because of this error: "reference to packed field is unaligned" when using if block
     match eth_hdr.ether_type {
         EtherType::Arp => {
@@ -81,25 +146,60 @@ fn try_bpflan(mut ctx: TcContext, direction: Direction) -> Result<i32, ()> {
         _ => {}
     }
 
-    info!(&ctx, "Dst addr: {:mac}", eth_hdr.dst_addr);
-
     // Broadcast
     if eth_hdr.dst_addr == BROADCAST {
         info!(&ctx, "Broadcast!");
-        //let keys = PEERS.keys();
-        //for (key, _) in PEERS.keys {
-        //
-        //}
-        // Wrap in VXLAN
 
-        // Duplicate and redirect to each peer
+        // ebpf calls this block an infinite loop unless we bound it, but
+        // this isn't an issue as long as the linked list doesn't loop
+        let mut next_index = 0;
+        let mut x = 0;
+        let mut vxlan_wrapped = false;
+        while let Some(peer) = unsafe { PEERS.get(&next_index) } {
+            if x >= 1024 {
+                break;
+            }
 
-        // Unwrap VXLAN
+            if *peer == 0 {
+                break;
+            }
+
+            info!(&ctx, "Peer: {}", *peer);
+
+            // Wrap in VXLAN
+            if !vxlan_wrapped {
+                vxlan_wrap(&mut ctx, *peer)?;
+                vxlan_wrapped = true;
+            }
+            // If the packet has already been wrapped:
+            else {
+                // Modify destination address
+                let mut ip_hdr: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
+                ip_hdr.set_dst_addr(Ipv4Addr::from_bits(*peer));
+                ctx.store(EthHdr::LEN, &ip_hdr, 0).map_err(|_| ())?;
+            }
+
+            // Duplicate and redirect to each peer
+            // unsafe {
+            //     bpf_f_clone_redirect(ctx.as_ptr(), 0, Direction::Egress as u64);
+            // }
+
+            next_index = *peer;
+            x += 1;
+        }
+
+        if vxlan_wrapped {
+            vxlan_unwrap(&mut ctx);
+        }
+
+        info!(&ctx, "Done");
+
+        return Ok(TC_ACT_PIPE);
     }
     // Check if packet will be sent to peer
     else if let Some(peer_ipv4) = unsafe { ARP_CACHE.get(&eth_hdr.dst_addr) } {
         // Wrap in VXLAN
-
+        vxlan_wrap(&mut ctx, *peer_ipv4)?;
         // Forward packet
         return Ok(TC_ACT_PIPE);
     }
@@ -107,98 +207,6 @@ fn try_bpflan(mut ctx: TcContext, direction: Direction) -> Result<i32, ()> {
     // TODO: multicast
 
     Ok(TC_ACT_PIPE)
-
-    /*
-    match eth_hdr.ether_type {
-        EtherType::Ipv4 => {
-            let mut ipv4_hdr: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
-
-            match ipv4_hdr.proto {
-                IpProto::Udp => {
-                    let mut udp_hdr: UdpHdr =
-                        ctx.load(EthHdr::LEN + Ipv4Hdr::LEN).map_err(|_| ())?;
-                    if udp_hdr.dest == 4789 {
-                        // TODO: unwrap VXLAN headers
-                        // TODO: account for potential user VXLAN traffic (not coming from bpflan) i.e. don't unwrap VXLAN
-                    }
-
-                    Ok(TC_ACT_PIPE)
-                }
-                IpProto::Icmp => {
-                    //if Direction::Egress == direction {
-                    let eth_src = eth_hdr.src_addr;
-                    let eth_dst = eth_hdr.dst_addr;
-                    info!(&ctx, "Eth src: {:mac}", eth_src);
-                    info!(&ctx, "Eth dst: {:mac}", eth_dst);
-
-                    let ip_src = u32::from_be(ipv4_hdr.src_addr);
-                    let ip_dst = u32::from_be(ipv4_hdr.dst_addr);
-                    info!(&ctx, "IP src: {:i}", ip_src);
-                    info!(&ctx, "IP dst: {:i}", ip_dst);
-
-                    // unsafe {
-                    //     bpf_skb_adjust_room(ctx.skb.skb, -(BUFFER_LEN as i32), 0, 0);
-                    // }
-
-                    // ipv4_hdr.set_dst_addr(Ipv4Addr::new(8, 8, 8, 8));
-                    // ctx.store(EthHdr::LEN, &ipv4_hdr, 0).map_err(|_| ())?;
-
-                    let _ = HIT_COUNT.output(&1, 0);
-
-                    let len = ctx.len();
-
-                    /*
-                    unsafe {
-                        bpf_skb_change_head(ctx.skb.skb, BUFFER_LEN as u32, 0);
-                    }
-
-                    let mut eth_hdr: EthHdr = ctx.load(0).map_err(|_| ())?;
-                    eth_hdr.dst_addr = [0, 1, 2, 3, 4, 5];
-                    eth_hdr.src_addr = [6, 7, 8, 9, 10, 11];
-                    eth_hdr.ether_type = EtherType::Ipv4;
-                    ctx.store(0, &eth_hdr, 0).map_err(|_| ())?;
-
-                    let mut ip_hdr: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
-                    ip_hdr.set_version(4);
-                    ip_hdr.set_src_addr(Ipv4Addr::new(1, 2, 3, 4));
-                    ip_hdr.set_dst_addr(Ipv4Addr::new(5, 6, 7, 8));
-                    ip_hdr.proto = IpProto::Udp;
-                    ip_hdr.set_ihl(5);
-                    ctx.store(EthHdr::LEN, &ip_hdr, 0).map_err(|_| ())?;
-
-                    let mut udp_hdr: UdpHdr =
-                        ctx.load(EthHdr::LEN + Ipv4Hdr::LEN).map_err(|_| ())?;
-                    // For now using arbitrary source port
-                    udp_hdr.source = (60000 as u16).to_be();
-                    udp_hdr.dest = (4789 as u16).to_be();
-                    let payload_len = len + (VxlanHdr::LEN + UdpHdr::LEN) as u32;
-                    info!(&ctx, "Payload len: {}", payload_len);
-                    udp_hdr.len = (payload_len as u16).to_be();
-                    ctx.store(EthHdr::LEN + Ipv4Hdr::LEN, &udp_hdr, 0)
-                        .map_err(|_| ())?;
-
-                    let mut vxlan_hdr: VxlanHdr = ctx
-                        .load(EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN)
-                        .map_err(|_| ())?;
-
-                    // set_vni_valid doesn't seem to work?
-                    vxlan_hdr.flags.set_bit(3, true);
-                    vxlan_hdr.vni = ((200 << 8) as u32).to_be();
-                    ctx.store(EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN, &vxlan_hdr, 0)
-                        .map_err(|_| ())?;
-
-                    */
-                    //}
-
-                    Ok(TC_ACT_PIPE)
-                }
-                _ => Ok(TC_ACT_PIPE),
-            }
-        }
-        _ => Ok(TC_ACT_PIPE),
-    }
-
-    */
 }
 
 #[cfg(not(test))]

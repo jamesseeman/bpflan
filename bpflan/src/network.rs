@@ -63,7 +63,6 @@ impl Network {
         name: String,
     ) -> Option<(u32, [u8; 6])> {
         let mut links = handle.link().get().match_name(name.clone()).execute();
-
         match links.try_next().await {
             Ok(result) => match result {
                 Some(link) => {
@@ -100,7 +99,6 @@ impl Network {
         tokio::spawn(connection);
 
         let iface = format!("bpf-{}", name);
-        let links = handle.link().get().match_name(iface.clone()).execute();
         // Check if interface already exists
         let (if_index, hw_addr) = match Network::get_interface_by_name(&handle, iface.clone()).await
         {
@@ -137,13 +135,14 @@ impl Network {
         program_out.load()?;
         program_out.attach(&iface, TcAttachType::Ingress)?;
 
+        // TODO: move following block to separate function
         let ebpf_clone = ebpf.clone();
         tokio::spawn(async move {
-            let mut ebpf_mut = ebpf_clone.lock().await;
-            let arp_cache: EbpfHashMap<_, [u8; 6], u32> =
-                EbpfHashMap::try_from(ebpf_mut.map_mut("ARP_CACHE").unwrap()).unwrap();
-
             loop {
+                let mut ebpf_mut = ebpf_clone.lock().await;
+                let arp_cache: EbpfHashMap<_, [u8; 6], u32> =
+                    EbpfHashMap::try_from(ebpf_mut.map_mut("ARP_CACHE").unwrap()).unwrap();
+
                 std::thread::sleep(Duration::from_secs(1));
 
                 for entry in arp_cache.iter() {
@@ -170,6 +169,7 @@ impl Network {
         advertise_addr: Ipv4Addr,
     ) -> Result<u32, crate::Error> {
         let (connection, handle, _) = rtnetlink::new_connection()?;
+        tokio::spawn(connection);
         if let Some((if_index, _)) = Network::get_interface_by_name(&handle, parent.into()).await {
             self.parent_if = Some(BridgeInterface {
                 name: parent.into(),
@@ -188,7 +188,27 @@ impl Network {
         let mut peers: EbpfHashMap<_, u32, u32> =
             EbpfHashMap::try_from(ebpf_mut.map_mut("PEERS").unwrap())?;
         let peer_int: u32 = peer.into();
-        peers.insert(peer_int, 1, 0); // The value doesn't really matter
+
+        // PEERS is structured as a linked list
+        let mut prev_peer = 0;
+        while let Ok(value) = peers.get(&prev_peer, 0) {
+            if value == 0 {
+                break;
+            } else {
+                prev_peer = value;
+            }
+        }
+
+        // Point previous peer to new peer
+        let _ = peers.insert(prev_peer, peer_int, 0);
+
+        // New peer is the end of the list
+        let _ = peers.insert(peer_int, 0, 0);
+
+        for result in peers.iter() {
+            println!("{:?}", result.unwrap());
+        }
+
         Ok(())
     }
 
@@ -197,7 +217,21 @@ impl Network {
         let mut peers: EbpfHashMap<_, u32, u32> =
             EbpfHashMap::try_from(ebpf_mut.map_mut("PEERS").unwrap())?;
         let peer_int: u32 = peer.into();
-        peers.remove(&peer_int)?;
+
+        let prev_peer = 0;
+        let next_peer = peers.get(&peer_int, 0)?;
+        while let Ok(value) = peers.get(&prev_peer, 0) {
+            if value == peer_int {
+                break;
+            }
+            // If we've reached the end of the list without finding the peer...
+            else if value == 0 {
+                return Ok(());
+            }
+        }
+
+        let _ = peers.insert(prev_peer, next_peer, 0);
+
         Ok(())
     }
 
