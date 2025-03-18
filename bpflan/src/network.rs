@@ -39,6 +39,10 @@ const TUNSETIFF: u64 = 0x400454ca;
 const IFF_TAP: i16 = 0x0002; // TAP device
 const IFF_NO_PI: i16 = 0x1000; // No packet information
 
+const IF_INDEX: u32 = 0;
+const ADVERTISE_ADDR: u32 = 1;
+const VNI: u32 = 2;
+
 #[derive(Debug)]
 struct BridgeInterface {
     name: String,
@@ -50,7 +54,7 @@ struct BridgeInterface {
 pub struct Network {
     name: String,
     if_index: u32,
-    vni: u16, // Technically this is u24, but leaving as u16 for now
+    vni: u32, // Technically this is u24
     hw_addr: [u8; 6],
     ebpf: Arc<Mutex<Ebpf>>,
     ports: Vec<Port>,
@@ -89,10 +93,11 @@ impl Network {
         }
     }
 
+    // Todo: VNI is actually u24, we need to verify that value isn't greater than max valid VNI
     pub async fn create(
         ebpf: Arc<Mutex<Ebpf>>,
         name: &str,
-        vni: u16,
+        vni: u32,
     ) -> Result<Self, crate::Error> {
         // Connect to rtnetlink
         let (connection, handle, _) = rtnetlink::new_connection()?;
@@ -134,6 +139,10 @@ impl Network {
             ebpf_mut.program_mut("bpflan_in").unwrap().try_into()?;
         program_out.load()?;
         program_out.attach(&iface, TcAttachType::Ingress)?;
+
+        let mut config: EbpfHashMap<_, u32, u32> =
+            EbpfHashMap::try_from(ebpf_mut.map_mut("CONFIG").unwrap())?;
+        let _ = config.insert(VNI, vni, 0);
 
         // TODO: move following block to separate function
         let ebpf_clone = ebpf.clone();
@@ -177,6 +186,12 @@ impl Network {
                 advertise_addr,
             });
 
+            let mut ebpf_mut = self.ebpf.lock().await;
+            let mut config: EbpfHashMap<_, u32, u32> =
+                EbpfHashMap::try_from(ebpf_mut.map_mut("CONFIG").unwrap())?;
+            let _ = config.insert(IF_INDEX, if_index, 0);
+            let _ = config.insert(ADVERTISE_ADDR, advertise_addr.to_bits(), 0);
+
             Ok(if_index)
         } else {
             Err(crate::Error::InterfaceNotFound)
@@ -205,9 +220,9 @@ impl Network {
         // New peer is the end of the list
         let _ = peers.insert(peer_int, 0, 0);
 
-        for result in peers.iter() {
-            println!("{:?}", result.unwrap());
-        }
+        // for result in peers.iter() {
+        //     println!("{:?}", result.unwrap());
+        // }
 
         Ok(())
     }

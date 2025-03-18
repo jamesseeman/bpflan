@@ -5,7 +5,10 @@ use core::{mem, net::Ipv4Addr};
 
 use aya_ebpf::{
     bindings::{xdp_action, TC_ACT_PIPE, TC_ACT_SHOT},
-    helpers::{bpf_map_update_elem, bpf_skb_adjust_room, bpf_skb_change_head, bpf_skb_change_type},
+    helpers::{
+        bpf_map_update_elem, bpf_skb_adjust_room, bpf_skb_change_head, bpf_skb_change_type,
+        gen::bpf_clone_redirect,
+    },
     macros::{classifier, map, xdp},
     maps::{Array, HashMap, RingBuf},
     programs::{TcContext, XdpContext},
@@ -24,8 +27,15 @@ use network_types::{
 const BROADCAST: [u8; 6] = [255, 255, 255, 255, 255, 255];
 const BUFFER_LEN: usize = EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN + VxlanHdr::LEN;
 
+const IF_INDEX: u32 = 0;
+const ADVERTISE_ADDR: u32 = 1;
+const VNI: u32 = 2;
+// CONFIG[IF_INDEX]: the u32 of the physical parent interface
+// CONFIG[ADVERTISE_ADDR]: the IPv4 address of the parent interface
+// CONFIG[VNI]: the vxlan for the network
+// TODO: these will need to be restructured to support multiple networks
 #[map]
-static HIT_COUNT: RingBuf = RingBuf::with_byte_size(4, 0);
+static CONFIG: HashMap<u32, u32> = HashMap::with_max_entries(64, 0);
 
 // The ARP_CACHE map is structured based on the way bpflan handles traffic:
 // When processing traffic, we need to know whether the packet's destination
@@ -51,11 +61,6 @@ static ARP_CACHE: HashMap<[u8; 6], u32> = HashMap::with_max_entries(65536, 0);
 // PEERS[3232235523] = 0
 #[map]
 static PEERS: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
-
-// #[link(name = "bpf")]
-// extern "C" {
-//     fn bpf_f_clone_redirect(ctx: *mut core::ffi::c_void, ifindex: u32, direction: u64) -> i32;
-// }
 
 #[derive(PartialEq)]
 enum Direction {
@@ -90,6 +95,7 @@ fn vxlan_wrap(ctx: &mut TcContext, peer_addr: u32) -> Result<(), ()> {
     }
 
     let mut eth_hdr: EthHdr = ctx.load(0).map_err(|_| ())?;
+    // TODO: determine these values
     eth_hdr.dst_addr = [0, 1, 2, 3, 4, 5];
     eth_hdr.src_addr = [6, 7, 8, 9, 10, 11];
     eth_hdr.ether_type = EtherType::Ipv4;
@@ -97,7 +103,10 @@ fn vxlan_wrap(ctx: &mut TcContext, peer_addr: u32) -> Result<(), ()> {
 
     let mut ip_hdr: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
     ip_hdr.set_version(4);
-    ip_hdr.set_src_addr(Ipv4Addr::new(1, 2, 3, 4));
+    // TODO: fix this awkward if statement. Simply using unwrap() results in ebpf code failing to load
+    if let Some(advertise_addr) = unsafe { CONFIG.get(&ADVERTISE_ADDR) } {
+        ip_hdr.set_src_addr(Ipv4Addr::from_bits(*advertise_addr));
+    }
     ip_hdr.set_dst_addr(peer_addr.into());
     ip_hdr.proto = IpProto::Udp;
     ip_hdr.set_ihl(5);
@@ -119,7 +128,9 @@ fn vxlan_wrap(ctx: &mut TcContext, peer_addr: u32) -> Result<(), ()> {
 
     // set_vni_valid doesn't seem to work?
     vxlan_hdr.flags.set_bit(3, true);
-    vxlan_hdr.vni = ((200 << 8) as u32).to_be();
+    if let Some(vni) = unsafe { CONFIG.get(&VNI) } {
+        vxlan_hdr.vni = ((*vni << 8) as u32).to_be();
+    }
     ctx.store(EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN, &vxlan_hdr, 0)
         .map_err(|_| ())?;
 
@@ -180,9 +191,9 @@ fn try_bpflan(mut ctx: TcContext, direction: Direction) -> Result<i32, ()> {
             }
 
             // Duplicate and redirect to each peer
-            // unsafe {
-            //     bpf_f_clone_redirect(ctx.as_ptr(), 0, Direction::Egress as u64);
-            // }
+            if let Some(if_index) = unsafe { CONFIG.get(&IF_INDEX) } {
+                let _ = ctx.clone_redirect(*if_index, 0);
+            }
 
             next_index = *peer;
             x += 1;

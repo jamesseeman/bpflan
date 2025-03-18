@@ -63,7 +63,7 @@ impl Handle {
     pub async fn create_network_with_vni(
         &mut self,
         name: &str,
-        vni: u16,
+        vni: u32,
     ) -> Result<Network, crate::Error> {
         Network::create(self.ebpf.clone(), name, vni).await
     }
