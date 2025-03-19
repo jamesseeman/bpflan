@@ -8,7 +8,7 @@ use netlink_packet_route::link::LinkAttribute;
 use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
 use rand::{distributions::Alphanumeric, Rng};
-use std::{ffi::CString, net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{ffi::CString, net::Ipv4Addr, sync::Arc};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -39,15 +39,12 @@ const TUNSETIFF: u64 = 0x400454ca;
 const IFF_TAP: i16 = 0x0002; // TAP device
 const IFF_NO_PI: i16 = 0x1000; // No packet information
 
-const IF_INDEX: u32 = 0;
-const ADVERTISE_ADDR: u32 = 1;
-const VNI: u32 = 2;
-
 #[derive(Debug)]
 struct BridgeInterface {
     name: String,
     if_index: u32,
-    advertise_addr: Ipv4Addr,
+    ip_addr: Ipv4Addr,
+    mac_addr: [u8; 6],
 }
 
 #[derive(Debug)]
@@ -140,10 +137,11 @@ impl Network {
         program_out.load()?;
         program_out.attach(&iface, TcAttachType::Ingress)?;
 
-        let mut config: EbpfHashMap<_, u32, u32> =
-            EbpfHashMap::try_from(ebpf_mut.map_mut("CONFIG").unwrap())?;
-        let _ = config.insert(VNI, vni, 0);
+        let mut vni_map: EbpfHashMap<_, u32, u32> =
+            EbpfHashMap::try_from(ebpf_mut.map_mut("VNI").unwrap())?;
+        let _ = vni_map.insert(if_index, vni, 0);
 
+        /*
         // TODO: move following block to separate function
         let ebpf_clone = ebpf.clone();
         tokio::spawn(async move {
@@ -160,6 +158,7 @@ impl Network {
                 }
             }
         });
+        */
 
         Ok(Self {
             name: name.into(),
@@ -172,25 +171,41 @@ impl Network {
         })
     }
 
+    pub fn get_if_index(&self) -> u32 {
+        self.if_index
+    }
+
+    pub fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
     pub async fn set_parent(
         &mut self,
         parent: &str,
-        advertise_addr: Ipv4Addr,
+        ip_addr: Ipv4Addr,
     ) -> Result<u32, crate::Error> {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
-        if let Some((if_index, _)) = Network::get_interface_by_name(&handle, parent.into()).await {
+        if let Some((if_index, hw_addr)) =
+            Network::get_interface_by_name(&handle, parent.into()).await
+        {
             self.parent_if = Some(BridgeInterface {
                 name: parent.into(),
                 if_index,
-                advertise_addr,
+                ip_addr,
+                mac_addr: hw_addr,
             });
 
             let mut ebpf_mut = self.ebpf.lock().await;
-            let mut config: EbpfHashMap<_, u32, u32> =
-                EbpfHashMap::try_from(ebpf_mut.map_mut("CONFIG").unwrap())?;
-            let _ = config.insert(IF_INDEX, if_index, 0);
-            let _ = config.insert(ADVERTISE_ADDR, advertise_addr.to_bits(), 0);
+            let mut if_map: EbpfHashMap<_, u32, u32> =
+                EbpfHashMap::try_from(ebpf_mut.map_mut("PARENT_IF").unwrap())?;
+            let _ = if_map.insert(self.if_index, if_index, 0);
+            let mut ip_map: EbpfHashMap<_, u32, u32> =
+                EbpfHashMap::try_from(ebpf_mut.map_mut("PARENT_IP").unwrap())?;
+            let _ = ip_map.insert(self.if_index, ip_addr.to_bits(), 0);
+            let mut hwaddr_map: EbpfHashMap<_, u32, [u8; 6]> =
+                EbpfHashMap::try_from(ebpf_mut.map_mut("PARENT_MAC").unwrap())?;
+            let _ = hwaddr_map.insert(self.if_index, hw_addr, 0);
 
             Ok(if_index)
         } else {
@@ -220,10 +235,6 @@ impl Network {
         // New peer is the end of the list
         let _ = peers.insert(peer_int, 0, 0);
 
-        // for result in peers.iter() {
-        //     println!("{:?}", result.unwrap());
-        // }
-
         Ok(())
     }
 
@@ -246,6 +257,7 @@ impl Network {
         }
 
         let _ = peers.insert(prev_peer, next_peer, 0);
+        let _ = peers.remove(&peer_int);
 
         Ok(())
     }

@@ -27,15 +27,14 @@ use network_types::{
 const BROADCAST: [u8; 6] = [255, 255, 255, 255, 255, 255];
 const BUFFER_LEN: usize = EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN + VxlanHdr::LEN;
 
-const IF_INDEX: u32 = 0;
-const ADVERTISE_ADDR: u32 = 1;
-const VNI: u32 = 2;
-// CONFIG[IF_INDEX]: the u32 of the physical parent interface
-// CONFIG[ADVERTISE_ADDR]: the IPv4 address of the parent interface
-// CONFIG[VNI]: the vxlan for the network
-// TODO: these will need to be restructured to support multiple networks
 #[map]
-static CONFIG: HashMap<u32, u32> = HashMap::with_max_entries(64, 0);
+static VNI: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+#[map]
+static PARENT_IF: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+#[map]
+static PARENT_IP: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+#[map]
+static PARENT_MAC: HashMap<u32, [u8; 6]> = HashMap::with_max_entries(1024, 0);
 
 // The ARP_CACHE map is structured based on the way bpflan handles traffic:
 // When processing traffic, we need to know whether the packet's destination
@@ -88,6 +87,7 @@ pub fn bpflan_in(ctx: TcContext) -> i32 {
 
 fn vxlan_wrap(ctx: &mut TcContext, peer_addr: u32) -> Result<(), ()> {
     let len = ctx.len();
+    let if_index = unsafe { *ctx.skb.skb }.ifindex;
 
     // Add a buffer to the beginning of the packet
     unsafe {
@@ -95,20 +95,23 @@ fn vxlan_wrap(ctx: &mut TcContext, peer_addr: u32) -> Result<(), ()> {
     }
 
     let mut eth_hdr: EthHdr = ctx.load(0).map_err(|_| ())?;
-    // TODO: determine these values
-    eth_hdr.dst_addr = [0, 1, 2, 3, 4, 5];
-    eth_hdr.src_addr = [6, 7, 8, 9, 10, 11];
+    // TODO: determine dst_addr
+    // eth_hdr.dst_addr = [0, 1, 2, 3, 4, 5];
+    if let Some(hw_addr) = unsafe { PARENT_MAC.get(&if_index) } {
+        eth_hdr.src_addr = *hw_addr;
+    }
     eth_hdr.ether_type = EtherType::Ipv4;
     ctx.store(0, &eth_hdr, 0).map_err(|_| ())?;
 
     let mut ip_hdr: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
     ip_hdr.set_version(4);
     // TODO: fix this awkward if statement. Simply using unwrap() results in ebpf code failing to load
-    if let Some(advertise_addr) = unsafe { CONFIG.get(&ADVERTISE_ADDR) } {
-        ip_hdr.set_src_addr(Ipv4Addr::from_bits(*advertise_addr));
+    if let Some(parent_ip) = unsafe { PARENT_IP.get(&if_index) } {
+        ip_hdr.set_src_addr(Ipv4Addr::from_bits(*parent_ip));
     }
     ip_hdr.set_dst_addr(peer_addr.into());
     ip_hdr.proto = IpProto::Udp;
+    ip_hdr.ttl = 64;
     ip_hdr.set_ihl(5);
     ctx.store(EthHdr::LEN, &ip_hdr, 0).map_err(|_| ())?;
 
@@ -128,7 +131,7 @@ fn vxlan_wrap(ctx: &mut TcContext, peer_addr: u32) -> Result<(), ()> {
 
     // set_vni_valid doesn't seem to work?
     vxlan_hdr.flags.set_bit(3, true);
-    if let Some(vni) = unsafe { CONFIG.get(&VNI) } {
+    if let Some(vni) = unsafe { VNI.get(&if_index) } {
         vxlan_hdr.vni = ((*vni << 8) as u32).to_be();
     }
     ctx.store(EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN, &vxlan_hdr, 0)
@@ -160,6 +163,10 @@ fn try_bpflan(mut ctx: TcContext, direction: Direction) -> Result<i32, ()> {
     // Broadcast
     if eth_hdr.dst_addr == BROADCAST {
         info!(&ctx, "Broadcast!");
+        // let ifindex = unsafe { *ctx.skb.skb }.ifindex;
+        // let ingress = unsafe { *ctx.skb.skb }.ingress_ifindex;
+        // let tcindex = unsafe {*ctx.skb.skb}.tc_index;
+        // info!(&ctx, "{} - {} - {}", ifindex, ingress, tcindex);
 
         // ebpf calls this block an infinite loop unless we bound it, but
         // this isn't an issue as long as the linked list doesn't loop
@@ -175,8 +182,6 @@ fn try_bpflan(mut ctx: TcContext, direction: Direction) -> Result<i32, ()> {
                 break;
             }
 
-            info!(&ctx, "Peer: {}", *peer);
-
             // Wrap in VXLAN
             if !vxlan_wrapped {
                 vxlan_wrap(&mut ctx, *peer)?;
@@ -191,8 +196,9 @@ fn try_bpflan(mut ctx: TcContext, direction: Direction) -> Result<i32, ()> {
             }
 
             // Duplicate and redirect to each peer
-            if let Some(if_index) = unsafe { CONFIG.get(&IF_INDEX) } {
-                let _ = ctx.clone_redirect(*if_index, 0);
+            let if_index = unsafe { *ctx.skb.skb }.ifindex;
+            if let Some(parent_if) = unsafe { PARENT_IF.get(&if_index) } {
+                let _ = ctx.clone_redirect(*parent_if, 0);
             }
 
             next_index = *peer;
@@ -202,8 +208,6 @@ fn try_bpflan(mut ctx: TcContext, direction: Direction) -> Result<i32, ()> {
         if vxlan_wrapped {
             vxlan_unwrap(&mut ctx);
         }
-
-        info!(&ctx, "Done");
 
         return Ok(TC_ACT_PIPE);
     }
