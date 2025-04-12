@@ -127,19 +127,23 @@ impl Network {
         let mut ebpf_mut = ebpf.lock().await;
 
         // TODO: check if TC's are already attached for previously existing interfaces
-        let program_in: &mut SchedClassifier =
-            ebpf_mut.program_mut("bpflan_out").unwrap().try_into()?;
-        program_in.load()?;
-        program_in.attach(&iface, TcAttachType::Egress)?;
-
         let program_out: &mut SchedClassifier =
-            ebpf_mut.program_mut("bpflan_in").unwrap().try_into()?;
-        program_out.load()?;
-        program_out.attach(&iface, TcAttachType::Ingress)?;
+            ebpf_mut.program_mut("bpflan_out").unwrap().try_into()?;
+        program_out.load().unwrap();
+        program_out.attach(&iface, TcAttachType::Egress).unwrap();
 
-        let mut vni_map: EbpfHashMap<_, u32, u32> =
-            EbpfHashMap::try_from(ebpf_mut.map_mut("VNI").unwrap())?;
-        let _ = vni_map.insert(if_index, vni, 0);
+        let program_in: &mut SchedClassifier =
+            ebpf_mut.program_mut("bpflan_in").unwrap().try_into()?;
+        program_in.load()?;
+        program_in.attach(&iface, TcAttachType::Ingress)?;
+
+        let mut vni_bridge_map: EbpfHashMap<_, u32, u32> =
+            EbpfHashMap::try_from(ebpf_mut.map_mut("VNI_TO_BRIDGE").unwrap())?;
+        let _ = vni_bridge_map.insert(vni, if_index, 0);
+
+        let mut bridge_vni_map: EbpfHashMap<_, u32, u32> =
+            EbpfHashMap::try_from(ebpf_mut.map_mut("BRIDGE_TO_VNI").unwrap())?;
+        let _ = bridge_vni_map.insert(if_index, vni, 0);
 
         /*
         // TODO: move following block to separate function
@@ -179,6 +183,8 @@ impl Network {
         self.name.clone()
     }
 
+    // TODO: deal with subsequent calls to set_parent() i.e. removing TC program
+    // or just don't allow multiple calls, wrap this into create()
     pub async fn set_parent(
         &mut self,
         parent: &str,
@@ -202,10 +208,20 @@ impl Network {
             let _ = if_map.insert(self.if_index, if_index, 0);
             let mut ip_map: EbpfHashMap<_, u32, u32> =
                 EbpfHashMap::try_from(ebpf_mut.map_mut("PARENT_IP").unwrap())?;
-            let _ = ip_map.insert(self.if_index, ip_addr.to_bits(), 0);
+            let _ = ip_map.insert(if_index, ip_addr.to_bits(), 0);
             let mut hwaddr_map: EbpfHashMap<_, u32, [u8; 6]> =
                 EbpfHashMap::try_from(ebpf_mut.map_mut("PARENT_MAC").unwrap())?;
-            let _ = hwaddr_map.insert(self.if_index, hw_addr, 0);
+            let _ = hwaddr_map.insert(if_index, hw_addr, 0);
+
+            let program_out: &mut SchedClassifier =
+                ebpf_mut.program_mut("parent_out").unwrap().try_into()?;
+            program_out.load()?;
+            program_out.attach(parent, TcAttachType::Egress)?;
+
+            let program_in: &mut SchedClassifier =
+                ebpf_mut.program_mut("parent_in").unwrap().try_into()?;
+            program_in.load()?;
+            program_in.attach(parent, TcAttachType::Ingress)?;
 
             Ok(if_index)
         } else {
@@ -234,6 +250,10 @@ impl Network {
 
         // New peer is the end of the list
         let _ = peers.insert(peer_int, 0, 0);
+
+        // TODO: send dummy packet to peer and capture L2 dst addr
+        // let mut peer_stack: Stack<_, u32> = Stack::try_from(ebpf_mut.map_mut("PEER_STACK").unwrap())?;
+        // let _ = peer_stack.push(peer_int, 0);
 
         Ok(())
     }
